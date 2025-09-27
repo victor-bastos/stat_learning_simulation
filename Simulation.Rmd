@@ -1,0 +1,129 @@
+---
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+------------------------------------------------------------------------
+
+title: "Simulation Plan — MATH 60603A" subtitle: "Impact of
+Multicollinearity on OLS, Ridge, and LASSO Regression" author: "Your
+Name" date: "`r format(Sys.Date())`" output: html_document: toc: true
+toc_float: true number_sections: true pdf_document: default ---
+
+```{r}
+print("hello")
+```
+
+# Data Generation
+
+In this section we simulate predictors $X$ from a multivariate normal
+distribution with a **controllable equicorrelation** $\rho$, and then
+generate the response $y = X\beta + \varepsilon$ with Gaussian noise. We
+define a sparse $\beta$ so that only a subset of predictors carries true
+signal (the remainder are pure noise).\
+By varying $\rho$ we introduce different levels of multicollinearity
+while keeping the data-generating mechanism fixed.
+
+The goals of this step are: - Create reproducible train/test samples for
+each $\rho$ in a user-defined grid. - Keep the true $\beta$ sparse to
+enable later evaluation of estimation variability and (for LASSO)
+selection stability. - Save the generated data in memory (and optionally
+to disk) for downstream modeling.
+
+------------------------------------------------------------------------
+
+```{r setup, message=FALSE, warning=FALSE}
+set.seed(60603)
+
+suppressPackageStartupMessages({
+  library(MASS)   # mvrnorm for multivariate normal draws
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+})
+
+```
+
+```{r}
+# Sample sizes
+n_train <- 250
+n_test  <- 1000
+
+# Dimensionality
+p <- 12
+
+# True sparse beta: indices with nonzero signal and their magnitudes
+signal_id <- c(1, 2, 3, 4)
+beta_sig  <- c(3, 2, 1.5, -2.5)
+
+# Noise standard deviation
+sigma_eps <- 2.0
+
+# Grid of equicorrelation levels to explore
+rho_grid <- seq(0, 0.9, by = 0.3)
+
+# Optional output directory for later use
+out_dir <- "results"
+if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
+
+```
+
+```{r}
+
+# Construct an equicorrelation covariance matrix (diagonal = 1, off-diagonal = rho)
+cov_equicor <- function(p, rho) {
+  Sigma <- matrix(rho, nrow = p, ncol = p)
+  diag(Sigma) <- 1
+  Sigma
+}
+
+# Generate a single dataset for given (n, p, rho) using sparse beta
+gen_dataset <- function(n, p, rho, signal_id, beta_sig, sigma_eps) {
+  Sigma <- cov_equicor(p, rho)
+  X <- MASS::mvrnorm(n = n, mu = rep(0, p), Sigma = Sigma)
+  beta <- rep(0, p); beta[signal_id] <- beta_sig
+  y <- as.numeric(X %*% beta + rnorm(n, mean = 0, sd = sigma_eps))
+  list(X = X, y = y, beta = beta, Sigma = Sigma, rho = rho)
+}
+
+# Generate paired train/test samples for a given rho
+gen_train_test <- function(p, rho, n_train, n_test, signal_id, beta_sig, sigma_eps) {
+  train <- gen_dataset(n_train, p, rho, signal_id, beta_sig, sigma_eps)
+  test  <- gen_dataset(n_test,  p, rho, signal_id, beta_sig, sigma_eps)
+  list(train = train, test = test, rho = rho)
+}
+
+```
+
+```{r}
+
+# Create a list of train/test datasets across rho levels
+datasets <- purrr::map(rho_grid, ~ gen_train_test(
+  p = p,
+  rho = .x,
+  n_train = n_train,
+  n_test  = n_test,
+  signal_id = signal_id,
+  beta_sig  = beta_sig,
+  sigma_eps = sigma_eps
+))
+
+# Name each entry by its rho for convenience
+names(datasets) <- paste0("rho_", format(rho_grid, nsmall = 1))
+
+# Quick sanity checks: dimensions and example correlations
+checks <- tibble::tibble(
+  rho = rho_grid,
+  train_n = purrr::map_int(datasets, ~ nrow(.x$train$X)),
+  test_n  = purrr::map_int(datasets, ~ nrow(.x$test$X)),
+  p       = purrr::map_int(datasets, ~ ncol(.x$train$X)),
+  approx_mean_offdiag_cor_train = purrr::map_dbl(datasets, function(d) {
+    C <- cor(d$train$X)
+    mean(C[upper.tri(C)])
+  })
+)
+
+checks
+
+```
