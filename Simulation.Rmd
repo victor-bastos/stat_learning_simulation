@@ -127,3 +127,54 @@ checks <- tibble::tibble(
 checks
 
 ```
+## Model Functions
+In this section, we define the functions to fit OLS, Ridge, and LASSO models along with their diagnostics.
+
+```{r modeling, message=FALSE, warning=FALSE}
+# Load required libraries
+library(car)      # For VIF
+library(glmnet)   # For Ridge and LASSO
+library(Metrics)  # For RMSE
+
+# OLS function
+ols_model <- function(X, y) {
+  model <- lm(y ~ X)
+  summary_model <- summary(model)
+  se <- summary_model$coefficients[, "Std. Error"]
+  p_values <- summary_model$coefficients[, "Pr(>|t|)"]
+  ci <- confint(model)
+  vif_values <- vif(model)
+  condition_num <- kappa(model)
+  list(model = model, se = se, p_values = p_values, ci = ci, vif = vif_values, condition_num = condition_num)
+}
+
+# Ridge function
+ridge_model <- function(X, y) {
+  ridge_cv <- cv.glmnet(X, y, alpha = 0)
+  best_lambda <- ridge_cv$lambda.min
+  ridge_fit <- glmnet(X, y, alpha = 0, lambda = best_lambda)
+  coefficients <- coef(ridge_fit)
+  effective_df <- sum(abs(coefficients) > 0)
+  norm_l2 <- sum(coefficients^2)
+  list(model = ridge_fit, best_lambda = best_lambda, coefficients = coefficients, effective_df = effective_df, norm_l2 = norm_l2)
+}
+
+# LASSO function
+lasso_model <- function(X, y) {
+  lasso_cv <- cv.glmnet(X, y, alpha = 1)
+  best_lambda <- lasso_cv$lambda.min
+  lasso_fit <- glmnet(X, y, alpha = 1, lambda = best_lambda)
+  coefficients <- coef(lasso_fit)
+  effective_df <- sum(abs(coefficients) > 0)
+  norm_l1 <- sum(abs(coefficients))
+  list(model = lasso_fit, best_lambda = best_lambda, coefficients = coefficients, effective_df = effective_df, norm_l1 = norm_l1)
+}
+
+# Example: fit OLS, Ridge, and LASSO on the first training dataset
+#train_data <- datasets[[1]]$train
+
+#ols_res <- ols_model(train_data$X, train_data$y)
+#ridge_res <- ridge_model(train_data$X, train_data$y)
+#lasso_res <- lasso_model(train_data$X, train_data$y)
+
+```
