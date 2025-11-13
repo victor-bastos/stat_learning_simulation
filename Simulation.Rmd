@@ -1,180 +1,419 @@
 ---
+
+title: "Simulation Plan — MATH 60603A" 
+subtitle: "Impact of Multicollinearity on OLS, Ridge, and LASSO Regression" 
+author: "Your Name" 
+date: "`r format(Sys.Date())`" 
+output: 
+ html_document: 
+ toc: true
+ toc_float: true 
+ number_sections: true 
+ pdf_document: default 
 editor_options: 
   markdown: 
     wrap: 72
 ---
 
-------------------------------------------------------------------------
+**Data Generation**
 
-title: "Simulation Plan — MATH 60603A" subtitle: "Impact of
-Multicollinearity on OLS, Ridge, and LASSO Regression" author: "Your
-Name" date: "`r format(Sys.Date())`" output: html_document: toc: true
-toc_float: true number_sections: true pdf_document: default ---
+We simulate predictors (X) from a multivariate normal distribution with an **AR(1) correlation** structure, where the covariance is
+(\Sigma_{ij}=\rho^{|i-j|}). For each (\rho) in our grid ({0, 0.5, 0.8, 0.95, 0.99}), we generate a dataset and then produce the response
+(y = X\beta + \varepsilon). The coefficient vector (\beta) has **15 non-zero** entries (decreasing magnitudes) and **5 zeros**, so most predictors carry real signal while a few are pure noise. Instead of fixing the noise variance, we set the **signal-to-noise ratio** to ( \text{SNR}=2 ) and choose the noise level so that (\mathrm{Var}(\text{signal})/\mathrm{Var}(\text{noise}) \approx 2). For each (\rho), we split data **70/30** into train/test and standardize features using **training** statistics only (the same centering/scaling is applied to test).
 
-```{r}
-print("hello")
-```
-
-# Data Generation
-
-In this section we simulate predictors $X$ from a multivariate normal
-distribution with a **controllable equicorrelation** $\rho$, and then
-generate the response $y = X\beta + \varepsilon$ with Gaussian noise. We
-define a sparse $\beta$ so that only a subset of predictors carries true
-signal (the remainder are pure noise).\
-By varying $\rho$ we introduce different levels of multicollinearity
-while keeping the data-generating mechanism fixed.
-
-The goals of this step are: - Create reproducible train/test samples for
-each $\rho$ in a user-defined grid. - Keep the true $\beta$ sparse to
-enable later evaluation of estimation variability and (for LASSO)
-selection stability. - Save the generated data in memory (and optionally
-to disk) for downstream modeling.
-
-------------------------------------------------------------------------
+---
 
 ```{r setup, message=FALSE, warning=FALSE}
 set.seed(60603)
 
 suppressPackageStartupMessages({
-  library(MASS)   # mvrnorm for multivariate normal draws
+  library(MASS)  
   library(dplyr)
   library(tidyr)
   library(purrr)
+  library(car)      
+  library(glmnet)  
+  library(Metrics) 
 })
 
 ```
 
 ```{r}
 # Sample sizes
-n_train <- 250
-n_test  <- 1000
+n_total    <- 3000         
+train_prop <- 0.7          
+n_train    <- floor(train_prop * n_total)
+n_test     <- n_total - n_train
 
 # Dimensionality
-p <- 12
+p <- 20
 
 # True sparse beta: indices with nonzero signal and their magnitudes
-signal_id <- c(1, 2, 3, 4)
-beta_sig  <- c(3, 2, 1.5, -2.5)
+beta <- c(2.0, 1.5, 1.2, 1.0, 0.8, rep(0, 15))
 
 # Noise standard deviation
-sigma_eps <- 2.0
+SNR <- 2
 
 # Grid of equicorrelation levels to explore
-rho_grid <- seq(0, 0.9, by = 0.3)
+rho_grid <- c(0, 0.5, 0.8, 0.95, 0.99)
 
 # Optional output directory for later use
 out_dir <- "results"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 ```
-
+2) Data generation (AR(1) + SNR control) and standardization
 ```{r}
 
-# Construct an equicorrelation covariance matrix (diagonal = 1, off-diagonal = rho)
-cov_equicor <- function(p, rho) {
-  Sigma <- matrix(rho, nrow = p, ncol = p)
-  diag(Sigma) <- 1
-  Sigma
+# ----- AR(1) covariance and generators -----
+
+# AR(1) covariance: Sigma_ij = rho^{|i-j|}
+cov_ar1 <- function(p, rho) {
+  idx <- 1:p
+  outer(idx, idx, function(i, j) rho^abs(i - j))
 }
 
-# Generate a single dataset for given (n, p, rho) using sparse beta
-gen_dataset <- function(n, p, rho, signal_id, beta_sig, sigma_eps) {
-  Sigma <- cov_equicor(p, rho)
+# Generate one dataset with SNR-controlled noise
+gen_dataset <- function(n, p, rho, beta, SNR) {
+  # build covariance and draw X
+  Sigma <- cov_ar1(p, rho)
   X <- MASS::mvrnorm(n = n, mu = rep(0, p), Sigma = Sigma)
-  beta <- rep(0, p); beta[signal_id] <- beta_sig
-  y <- as.numeric(X %*% beta + rnorm(n, mean = 0, sd = sigma_eps))
+
+  # linear signal
+  lin <- as.numeric(X %*% beta)          # <— create lin first
+
+  # choose noise sd so Var(signal)/Var(noise) ≈ SNR
+  signal_var <- stats::var(lin)          # <— var() now sees lin
+  noise_sd   <- sqrt(signal_var / SNR)
+  y <- lin + stats::rnorm(n, 0, noise_sd)
+
   list(X = X, y = y, beta = beta, Sigma = Sigma, rho = rho)
 }
 
-# Generate paired train/test samples for a given rho
-gen_train_test <- function(p, rho, n_train, n_test, signal_id, beta_sig, sigma_eps) {
-  train <- gen_dataset(n_train, p, rho, signal_id, beta_sig, sigma_eps)
-  test  <- gen_dataset(n_test,  p, rho, signal_id, beta_sig, sigma_eps)
-  list(train = train, test = test, rho = rho)
+# 70/30 split (or your chosen proportion)
+train_test_split <- function(X, y, prop = 0.7) {
+  n <- nrow(X)
+  idx <- sample.int(n, floor(prop * n))
+  list(
+    Xtr = X[idx, , drop = FALSE],
+    ytr = y[idx],
+    Xte = X[-idx, , drop = FALSE],
+    yte = y[-idx]
+  )
 }
+
+# standardize using TRAIN stats only
+standardize_by_train <- function(Xtr, Xte) {
+  mu <- colMeans(Xtr)
+  sd <- apply(Xtr, 2, sd); sd[sd == 0] <- 1
+  list(
+    Xtr = scale(Xtr, center = mu, scale = sd),
+    Xte = scale(Xte, center = mu, scale = sd),
+    mu = mu, sd = sd
+  )
+} 
+# Sanity: beta length must match p, and generator should return a list
+stopifnot(length(beta) == p)
+.tmp <- gen_dataset(n = 10, p = p, rho = 0.5, beta = beta, SNR = SNR)
+str(.tmp)
+
 
 ```
 
 ```{r}
 
-# Create a list of train/test datasets across rho levels
+# build datasets for each rho (independent train/test draws from same DGP)
+
+gen_train_test <- function(p, rho, n_train, n_test, beta, SNR) {
+tr <- gen_dataset(n_train, p, rho, beta, SNR)
+te <- gen_dataset(n_test,  p, rho, beta, SNR)
+list(train = tr, test = te, rho = rho)
+}
+
 datasets <- purrr::map(rho_grid, ~ gen_train_test(
-  p = p,
-  rho = .x,
-  n_train = n_train,
-  n_test  = n_test,
-  signal_id = signal_id,
-  beta_sig  = beta_sig,
-  sigma_eps = sigma_eps
+p       = p,
+rho     = .x,
+n_train = n_train,
+n_test  = n_test,
+beta    = beta,
+SNR     = SNR
 ))
+names(datasets) <- paste0("rho_", rho_grid)
 
-# Name each entry by its rho for convenience
-names(datasets) <- paste0("rho_", format(rho_grid, nsmall = 1))
+# sanity checks
 
-# Quick sanity checks: dimensions and example correlations
 checks <- tibble::tibble(
-  rho = rho_grid,
-  train_n = purrr::map_int(datasets, ~ nrow(.x$train$X)),
-  test_n  = purrr::map_int(datasets, ~ nrow(.x$test$X)),
-  p       = purrr::map_int(datasets, ~ ncol(.x$train$X)),
-  approx_mean_offdiag_cor_train = purrr::map_dbl(datasets, function(d) {
-    C <- cor(d$train$X)
-    mean(C[upper.tri(C)])
-  })
+rho = rho_grid,
+train_n = purrr::map_int(datasets, ~ nrow(.x$train$X)),
+test_n  = purrr::map_int(datasets, ~ nrow(.x$test$X)),
+p       = purrr::map_int(datasets, ~ ncol(.x$train$X)),
+approx_mean_offdiag_cor_train = purrr::map_dbl(datasets, function(d) {
+C <- cor(d$train$X); mean(C[upper.tri(C)])
+})
 )
-
 checks
+
 
 ```
 ## Model Functions
-In this section, we define the functions to fit OLS, Ridge, and LASSO models along with their diagnostics.
+We fit models on standardized X_train and predict on standardized X_test.
+Ridge/LASSO are cross-validated; norms exclude the intercept.
+For OLS we compute SEs, p-values, CIs, VIF, and condition number.
 
 ```{r modeling, message=FALSE, warning=FALSE}
-# Load required libraries
-library(car)      # For VIF
-library(glmnet)   # For Ridge and LASSO
-library(Metrics)  # For RMSE
 
+rmse <- function(pred, y) sqrt(mean((pred - y)^2))
 # OLS function
-ols_model <- function(X, y) {
-  model <- lm(y ~ X)
-  summary_model <- summary(model)
-  se <- summary_model$coefficients[, "Std. Error"]
-  p_values <- summary_model$coefficients[, "Pr(>|t|)"]
-  ci <- confint(model)
-  vif_values <- vif(model)
-  condition_num <- kappa(model)
-  list(model = model, se = se, p_values = p_values, ci = ci, vif = vif_values, condition_num = condition_num)
+ols_model <- function(X_tr_std, y_tr) {
+
+# build DF with names so car::vif works
+
+df_tr <- as.data.frame(X_tr_std); colnames(df_tr) <- paste0("x", 1:ncol(df_tr))
+df_tr$y <- y_tr
+model <- lm(y ~ ., data = df_tr)
+
+sm <- summary(model)
+se <- sm$coefficients[, "Std. Error"]
+p_values <- sm$coefficients[, "Pr(>|t|)"]
+ci <- confint(model)
+
+vif_values <- tryCatch(car::vif(model), error = function(e) NA)
+condition_num <- tryCatch(kappa(model), error = function(e) NA)
+
+list(
+model = model,
+info = list(se = se, p_values = p_values, ci = ci,
+vif = vif_values, condition_number = condition_num),
+predict = function(X_te_std){
+df_te <- as.data.frame(X_te_std); colnames(df_te) <- paste0("x", 1:ncol(df_te))
+as.numeric(predict(model, newdata = df_te))
+}
+)
 }
 
-# Ridge function
-ridge_model <- function(X, y) {
-  ridge_cv <- cv.glmnet(X, y, alpha = 0)
-  best_lambda <- ridge_cv$lambda.min
-  ridge_fit <- glmnet(X, y, alpha = 0, lambda = best_lambda)
-  coefficients <- coef(ridge_fit)
-  effective_df <- sum(abs(coefficients) > 0)
-  norm_l2 <- sum(coefficients^2)
-  list(model = ridge_fit, best_lambda = best_lambda, coefficients = coefficients, effective_df = effective_df, norm_l2 = norm_l2)
+# ---- RIDGE (CV) ----
+
+ridge_model <- function(X_tr_std, y_tr) {
+X <- as.matrix(X_tr_std)
+cv <- cv.glmnet(X, y_tr, alpha = 0, standardize = FALSE, nfolds = 5)
+fit <- glmnet(X, y_tr, alpha = 0, lambda = cv$lambda.min, standardize = FALSE)
+
+# coefficients (exclude intercept for norms)
+
+coef_vec <- as.numeric(coef(fit))           
+beta_no_int <- coef_vec[-1]
+
+list(
+model = fit,
+info = list(
+lambda = fit$lambda,
+edf    = fit$df,                         
+l2_norm = sqrt(sum(beta_no_int^2))
+),
+predict = function(X_te_std){
+as.numeric(predict(fit, newx = as.matrix(X_te_std)))
+}
+)
 }
 
-# LASSO function
-lasso_model <- function(X, y) {
-  lasso_cv <- cv.glmnet(X, y, alpha = 1)
-  best_lambda <- lasso_cv$lambda.min
-  lasso_fit <- glmnet(X, y, alpha = 1, lambda = best_lambda)
-  coefficients <- coef(lasso_fit)
-  effective_df <- sum(abs(coefficients) > 0)
-  norm_l1 <- sum(abs(coefficients))
-  list(model = lasso_fit, best_lambda = best_lambda, coefficients = coefficients, effective_df = effective_df, norm_l1 = norm_l1)
+# ---- LASSO (CV) ----
+
+lasso_model <- function(X_tr_std, y_tr) {
+X <- as.matrix(X_tr_std)
+cv <- cv.glmnet(X, y_tr, alpha = 1, standardize = FALSE, nfolds = 5)
+fit <- glmnet(X, y_tr, alpha = 1, lambda = cv$lambda.min, standardize = FALSE)
+
+coef_vec <- as.numeric(coef(fit))           
+beta_no_int <- coef_vec[-1]
+selected <- which(beta_no_int != 0)         
+
+list(
+model = fit,
+info = list(
+lambda   = fit$lambda,
+edf      = fit$df,                       
+l1_norm  = sum(abs(beta_no_int)),
+selected = selected
+),
+predict = function(X_te_std){
+as.numeric(predict(fit, newx = as.matrix(X_te_std)))
+}
+)
 }
 
-# Example: fit OLS, Ridge, and LASSO on the first training dataset
-#train_data <- datasets[[1]]$train
+```
+4) Example: fit models for one ρ (shows the full pipeline once)
+```{r}
+# pick a rho to demo
 
-#ols_res <- ols_model(train_data$X, train_data$y)
-#ridge_res <- ridge_model(train_data$X, train_data$y)
-#lasso_res <- lasso_model(train_data$X, train_data$y)
+demo <- datasets[[1]]           
+tr <- demo$train; te <- demo$test
+
+# standardize by TRAIN stats
+
+std <- standardize_by_train(tr$X, te$X)
+Xtr_s <- std$Xtr; Xte_s <- std$Xte; ytr <- tr$y; yte <- te$y
+
+ols   <- ols_model(Xtr_s, ytr)
+ridge <- ridge_model(Xtr_s, ytr)
+lasso <- lasso_model(Xtr_s, ytr)
+
+pred_ols   <- ols$predict(Xte_s)
+pred_ridge <- ridge$predict(Xte_s)
+pred_lasso <- lasso$predict(Xte_s)
+
+tibble::tibble(
+rho = demo$rho,
+RMSE_OLS   = rmse(pred_ols,   yte),
+RMSE_RIDGE = rmse(pred_ridge, yte),
+RMSE_LASSO = rmse(pred_lasso, yte)
+)
+```
+## Monte Carlo Simulation Loop
+We now repeat the data generation and model fitting many times to
+evaluate RMSE stability and shrinkage behavior across correlation levels.
+
+```{r}
+# ---- config for simulation loop ----
+MC_R <- 200                 
+RHO_VALUES <- c(0, 0.5, 0.8, 0.95, 0.99)
+set.seed(4242)
+```
+
+```{r}
+# ---- Monte Carlo loop with progress bar ----
+run_mc <- function(rhos = RHO_VALUES, R = MC_R){
+  total <- length(rhos) * R
+  pb <- txtProgressBar(min = 0, max = total, style = 3)
+
+  rmse_list <- vector("list", total)
+  diag_list <- vector("list", total)
+  sel_list  <- vector("list", total)
+  k <- 0
+
+  for (rho in rhos){
+    for (rep_id in seq_len(R)){
+      k <- k + 1
+      out <- one_rep(rho, rep_id)
+      rmse_list[[k]] <- out$rmse
+      diag_list[[k]] <- out$diag
+      sel_list[[k]]  <- out$lasso_sel
+      setTxtProgressBar(pb, k)
+    }
+  }
+  close(pb)
+
+  list(
+    rmse = do.call(rbind, rmse_list),
+    diag = do.call(rbind, diag_list),
+    lasso_sel = do.call(rbind, sel_list)
+  )
+}
+```
+
+```{r}
+# ---- one replication for a given rho ----
+rmse <- function(pred, y) sqrt(mean((pred - y)^2))
+
+one_rep <- function(rho, rep_id){
+  trte <- gen_train_test(p = p, rho = rho, n_train = n_train, n_test = n_test,
+                         beta = beta, SNR = SNR)
+  tr <- trte$train; te <- trte$test
+
+  std   <- standardize_by_train(tr$X, te$X)
+  Xtr_s <- std$Xtr; Xte_s <- std$Xte; ytr <- tr$y; yte <- te$y
+
+  m_ols   <- ols_model(Xtr_s, ytr)
+  m_ridge <- ridge_model(Xtr_s, ytr)
+  m_lasso <- lasso_model(Xtr_s, ytr)
+
+  pred_ols   <- m_ols$predict(Xte_s)
+  pred_ridge <- m_ridge$predict(Xte_s)
+  pred_lasso <- m_lasso$predict(Xte_s)
+
+  rmse_rows <- data.frame(
+    rho    = rho, rep = rep_id,
+    method = c("OLS","RIDGE","LASSO"),
+    RMSE   = c(rmse(pred_ols, yte), rmse(pred_ridge, yte), rmse(pred_lasso, yte))
+  )
+
+  diag_row <- data.frame(
+    rho = rho, rep = rep_id,
+    ridge_lambda = m_ridge$info$lambda,
+    ridge_edf    = m_ridge$info$edf,
+    ridge_l2     = m_ridge$info$l2_norm,
+    lasso_lambda = m_lasso$info$lambda,
+    lasso_edf    = m_lasso$info$edf,
+    lasso_l1     = m_lasso$info$l1_norm
+  )
+
+  sel_vec <- integer(p)
+  if(!is.null(m_lasso$info$selected) && length(m_lasso$info$selected) > 0){
+    sel_vec[m_lasso$info$selected] <- 1
+  }
+  lasso_sel_row <- data.frame(
+    rho = rho, rep = rep_id,
+    setNames(as.list(sel_vec), paste0("x", 1:p))
+  )
+
+  list(rmse = rmse_rows, diag = diag_row, lasso_sel = lasso_sel_row)
+}
+
+```
+
+```{r}
+# ---- full MC run ----
+mc_full <- run_mc(rhos = RHO_VALUES, R = MC_R)   
+
+# quick sanity peeks 
+head(mc_full$rmse)
+head(mc_full$diag)
+head(mc_full$lasso_sel[, 1:10])
+
+```
+
+```{r}
+# ---- summaries helper ----
+summarize_outputs <- function(mc){
+  rmse_sum <- aggregate(
+    RMSE ~ rho + method, mc$rmse,
+    function(x) c(mean = mean(x), sd = sd(x), se = sd(x)/sqrt(length(x)))
+  )
+  rmse_sum <- do.call(data.frame, rmse_sum)
+  names(rmse_sum)[3:5] <- c("mean_RMSE","sd_RMSE","se_RMSE")
+
+  p_loc <- ncol(mc$lasso_sel) - 2
+  sel_mat <- as.matrix(mc$lasso_sel[, -(1:2), drop = FALSE])
+  sel_freq <- aggregate(sel_mat, by = list(rho = mc$lasso_sel$rho), FUN = mean)
+  colnames(sel_freq)[-1] <- paste0("x", 1:p_loc)
+
+  shrink_sum <- aggregate(. ~ rho, mc$diag,
+                          function(z) if(is.numeric(z)) mean(z, na.rm = TRUE) else NA)
+
+  list(rmse = rmse_sum, sel = sel_freq, shrink = shrink_sum)
+}
+
+```
+
+```{r}
+# ---- summaries for full run ----
+sums_full <- summarize_outputs(mc_full)
+head(sums_full$rmse)
+head(sums_full$sel)
+head(sums_full$shrink)
+
+```
+
+```{r}
+# ---- save final outputs ----
+if (!dir.exists("outputs")) dir.create("outputs")
+
+saveRDS(mc_full,   "outputs/mc_raw_outputs.rds")
+saveRDS(sums_full, "outputs/mc_summaries.rds")
+
+# CSVs 
+write.csv(sums_full$rmse,   "outputs/rmse_by_rho.csv",      row.names = FALSE)
+write.csv(sums_full$sel,    "outputs/lasso_selection.csv",  row.names = FALSE)
+write.csv(sums_full$shrink, "outputs/shrinkage_by_rho.csv", row.names = FALSE)
 
 ```
