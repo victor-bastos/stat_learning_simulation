@@ -1,39 +1,28 @@
----
+------------------------------------------------------------------------
 
-title: "Simulation Plan — MATH 60603A" 
-subtitle: "Impact of Multicollinearity on OLS, Ridge, and LASSO Regression" 
-author: "Your Name" 
-date: "`r format(Sys.Date())`" 
-output: 
- html_document: 
- toc: true
- toc_float: true 
- number_sections: true 
- pdf_document: default 
-editor_options: 
-  markdown: 
-    wrap: 72
----
+title: "Simulation Plan — MATH 60603A" subtitle: "Impact of Multicollinearity on OLS, Ridge, and LASSO Regression" author: "Your Name" date: "`r format(Sys.Date())`" output: html_document: toc: true toc_float: true number_sections: true pdf_document: default editor_options: markdown: wrap: 72 ---
 
-**Data Generation**
+## **Data Generation**
 
-We simulate predictors (X) from a multivariate normal distribution with an **AR(1) correlation** structure, where the covariance is
-(\Sigma_{ij}=\rho^{|i-j|}). For each (\rho) in our grid ({0, 0.5, 0.8, 0.95, 0.99}), we generate a dataset and then produce the response
-(y = X\beta + \varepsilon). The coefficient vector (\beta) has **15 non-zero** entries (decreasing magnitudes) and **5 zeros**, so most predictors carry real signal while a few are pure noise. Instead of fixing the noise variance, we set the **signal-to-noise ratio** to ( \text{SNR}=2 ) and choose the noise level so that (\mathrm{Var}(\text{signal})/\mathrm{Var}(\text{noise}) \approx 2). For each (\rho), we split data **70/30** into train/test and standardize features using **training** statistics only (the same centering/scaling is applied to test).
+We simulate predictors (X) from a multivariate normal distribution with an **AR(1) correlation** structure, where the covariance is (\Sigma\_{ij}=\rho\^{\|i-j\|}). For each (\rho) in our grid ({0, 0.5, 0.8, 0.95, 0.99}), we generate a dataset and then produce the response (y = X\beta + \varepsilon). The coefficient vector (\beta) has **15 non-zero** entries (decreasing magnitudes) and **5 zeros**, so most predictors carry real signal while a few are pure noise. Instead of fixing the noise variance, we set the **signal-to-noise ratio** to ( \text{SNR}=2 ) and choose the noise level so that (\mathrm{Var}(\text{signal})/\mathrm{Var}(\text{noise}) \approx 2). For each (\rho), we split data **70/30** into train/test and standardize features using **training** statistics only (the same centering/scaling is applied to test).
 
----
+------------------------------------------------------------------------
 
 ```{r setup, message=FALSE, warning=FALSE}
 set.seed(60603)
+install.packages(c("glmnet", "Metrics", "ggplot2", "stringr", "scales"))
 
 suppressPackageStartupMessages({
   library(MASS)  
   library(dplyr)
   library(tidyr)
   library(purrr)
-  library(car)      
+  #library(car)      
   library(glmnet)  
   library(Metrics) 
+  library(knitr)
+  library(ggplot2)
+  library(stringr)
 })
 
 ```
@@ -62,7 +51,9 @@ out_dir <- "results"
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 ```
-2) Data generation (AR(1) + SNR control) and standardization
+
+2)  Data generation (AR(1) + SNR control) and standardization
+
 ```{r}
 
 # ----- AR(1) covariance and generators -----
@@ -155,10 +146,10 @@ checks
 
 
 ```
+
 ## Model Functions
-We fit models on standardized X_train and predict on standardized X_test.
-Ridge/LASSO are cross-validated; norms exclude the intercept.
-For OLS we compute SEs, p-values, CIs, VIF, and condition number.
+
+We fit models on standardized X_train and predict on standardized X_test. Ridge/LASSO are cross-validated; norms exclude the intercept. For OLS we compute SEs, p-values, CIs, VIF, and condition number.
 
 ```{r modeling, message=FALSE, warning=FALSE}
 
@@ -242,7 +233,9 @@ as.numeric(predict(fit, newx = as.matrix(X_te_std)))
 }
 
 ```
-4) Example: fit models for one ρ (shows the full pipeline once)
+
+4)  Example: fit models for one ρ (shows the full pipeline once)
+
 ```{r}
 # pick a rho to demo
 
@@ -269,9 +262,10 @@ RMSE_RIDGE = rmse(pred_ridge, yte),
 RMSE_LASSO = rmse(pred_lasso, yte)
 )
 ```
+
 ## Monte Carlo Simulation Loop
-We now repeat the data generation and model fitting many times to
-evaluate RMSE stability and shrinkage behavior across correlation levels.
+
+We now repeat the data generation and model fitting many times to evaluate RMSE stability and shrinkage behavior across correlation levels.
 
 ```{r}
 # ---- config for simulation loop ----
@@ -417,3 +411,440 @@ write.csv(sums_full$sel,    "outputs/lasso_selection.csv",  row.names = FALSE)
 write.csv(sums_full$shrink, "outputs/shrinkage_by_rho.csv", row.names = FALSE)
 
 ```
+
+## Analysis & Results
+
+```{r}
+# If the simulation objects are not in memory, reload from disk
+if (!exists("mc_full")) {
+  mc_full <- readRDS("outputs/mc_raw_outputs.rds")
+}
+if (!exists("sums_full")) {
+  sums_full <- readRDS("outputs/mc_summaries.rds")
+}
+
+# Extract summary components from sums_full
+rmse_sum   <- sums_full$rmse    # rho, method, mean_RMSE, sd_RMSE, se_RMSE
+sel_sum    <- sums_full$sel     # rho, selection probabilities x1,...,xp
+shrink_sum <- sums_full$shrink  # rho, ridge_lambda, ridge_edf, ridge_l2, ...
+
+# Ensure p and beta are defined consistently with the data-generating process
+if (!exists("p")) {
+  p <- 20
+}
+if (!exists("beta")) {
+  beta <- c(2.0, 1.5, 1.2, 1.0, 0.8, rep(0, 15))
+}
+if (!exists("SNR")) {
+  SNR <- 2
+}
+
+# True signal vs noise structure
+true_signal <- tibble(
+  var   = paste0("x", 1:p),
+  beta  = beta,
+  type  = if_else(beta != 0, "Signal (β ≠ 0)", "Noise (β = 0)")
+)
+
+# Make method a nice factor and prepare long RMSE data
+rmse_long <- mc_full$rmse %>%
+  mutate(
+    method = factor(method, levels = c("OLS", "RIDGE", "LASSO"))
+  )
+
+rmse_sum <- rmse_sum %>%
+  mutate(
+    method = factor(method, levels = c("OLS", "RIDGE", "LASSO"))
+  )
+```
+
+### Summary table of test RMSE
+
+```{r}
+rmse_sum %>%
+arrange(rho, method) %>%
+mutate(
+rho       = as.factor(rho),
+mean_RMSE = round(mean_RMSE, 3),
+sd_RMSE   = round(sd_RMSE, 3),
+se_RMSE   = round(se_RMSE, 3)
+) %>%
+kable(
+caption = "Test RMSE by method and correlation level (ρ): mean, standard deviation, and standard error.",
+col.names = c("ρ", "Method", "Mean RMSE", "SD(RMSE)", "SE(RMSE)")
+)
+
+```
+
+###  RMSE vs ρ: mean curves with uncertainty
+
+```{r rmse-relative-plot, message=FALSE, warning=FALSE, fig.width=7, fig.height=5}
+# Make sure dplyr and ggplot2 are available
+library(dplyr)
+library(ggplot2)
+
+# Compute excess RMSE relative to the best method at each rho
+rmse_rel <- rmse_sum %>%
+  group_by(rho) %>%
+  mutate(
+    best_rmse   = min(mean_RMSE),
+    excess_rmse = mean_RMSE - best_rmse
+  ) %>%
+  ungroup()
+
+# Plot: excess RMSE instead of absolute RMSE
+ggplot(rmse_rel,
+       aes(x = rho, y = excess_rmse, color = method, group = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  labs(
+    title    = "Excess test RMSE relative to the best method at each ρ",
+    subtitle = "Values above zero indicate worse predictive performance",
+    x        = expression(rho),
+    y        = "Excess test RMSE (RMSE − min RMSE(ρ))",
+    color    = "Method"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position  = "top",
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+### Full RMSE distributions across replications
+
+```{r}
+ggplot(rmse_long,
+aes(x = factor(rho), y = RMSE, fill = method)) +
+geom_boxplot(alpha = 0.7, outlier.alpha = 0.4) +
+labs(
+title = "Distribution of test RMSE by correlation level and method",
+x     = expression(rho),
+y     = "Test RMSE",
+fill  = "Method"
+) +
+theme_minimal(base_size = 13) +
+theme(
+legend.position   = "top",
+panel.grid.minor  = element_blank()
+)
+
+```
+
+### Shrinkage and Effective Complexity (Ridge & LASSO)
+
+```{r ridge-lasso-big-chunk, message=FALSE, warning=FALSE, fig.width=9, fig.height=6}
+# Libraries (safe to call again)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(knitr)
+
+#### 1) Shrinkage & Effective Complexity (Ridge + LASSO) ####
+
+# Build tidy shrinkage diagnostics
+shrink_long <- shrink_sum %>%
+  select(
+    rho,
+    ridge_lambda, ridge_edf, ridge_l2,
+    lasso_lambda, lasso_edf, lasso_l1
+  ) %>%
+  pivot_longer(
+    cols      = -rho,
+    names_to  = "metric",
+    values_to = "value"
+  ) %>%
+  mutate(
+    method = if_else(str_detect(metric, "^ridge"), "Ridge", "LASSO"),
+    quantity = case_when(
+      str_detect(metric, "lambda") ~ "Penalty λ",
+      str_detect(metric, "edf")    ~ "Effective degrees of freedom",
+      str_detect(metric, "l2")     ~ "||β||₂ (Ridge)",
+      str_detect(metric, "l1")     ~ "||β||₁ (LASSO)",
+      TRUE ~ metric
+    ),
+    method = factor(method, levels = c("Ridge", "LASSO"))
+  )
+
+## 1a) Penalty and effective degrees of freedom vs ρ
+plot_shrinkage_edf <- ggplot(
+  shrink_long %>%
+    filter(quantity %in% c("Penalty λ", "Effective degrees of freedom")),
+  aes(x = rho, y = value, color = method)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ quantity, scales = "free_y") +
+  scale_x_continuous(breaks = unique(shrink_long$rho)) +
+  labs(
+    title = "Penalty and effective complexity vs correlation (ρ)",
+    x     = expression(rho),
+    y     = NULL,
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position  = "top",
+    panel.grid.minor = element_blank()
+  )
+
+## 1b) Coefficient norms vs ρ
+plot_shrinkage_norms <- ggplot(
+  shrink_long %>%
+    filter(quantity %in% c("||β||₂ (Ridge)", "||β||₁ (LASSO)")),
+  aes(x = rho, y = value, color = method)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = unique(shrink_long$rho)) +
+  labs(
+    title = "Norms of coefficient vectors vs correlation (ρ)",
+    x     = expression(rho),
+    y     = "Coefficient norm",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position  = "top",
+    panel.grid.minor = element_blank()
+  )
+
+# Print the two shrinkage plots
+plot_shrinkage_edf
+plot_shrinkage_norms
+
+
+#### 2) LASSO Variable Selection Stability ####
+
+# Long-format selection probabilities
+lasso_sel_long <- sel_sum %>%
+  pivot_longer(
+    cols      = starts_with("x"),
+    names_to  = "var",
+    values_to = "sel_prob"
+  ) %>%
+  left_join(true_signal, by = "var")
+
+## 2a) Table of average selection probabilities
+lasso_sel_long %>%
+  arrange(rho, var) %>%
+  mutate(sel_prob = round(sel_prob, 3)) %>%
+  pivot_wider(
+    id_cols      = c(var, type),
+    names_from   = rho,
+    values_from  = sel_prob,
+    names_prefix = "rho_"
+  ) %>%
+  kable(
+    caption   = "Average LASSO selection probability for each predictor across correlation levels.",
+    col.names = c(
+      "Variable", "Type",
+      paste0("ρ = ", sort(unique(sel_sum$rho)))
+    )
+  )
+
+## 2b) Heatmap of LASSO selection stability
+ggplot(lasso_sel_long,
+       aes(x = var, y = factor(rho), fill = sel_prob)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(
+    low  = "white",
+    high = "steelblue",
+    name = "Selection\nprobability"
+  ) +
+  facet_wrap(~ type, nrow = 2, scales = "free_x") +
+  labs(
+    title = "LASSO variable-selection stability across correlation levels",
+    x     = "Predictor",
+    y     = expression(rho)
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid      = element_blank(),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    strip.text      = element_text(face = "bold")
+  )
+
+```
+
+### 
+
+### OLS Diagnostics Under Multicollinearity
+
+```{r}
+# This function runs one OLS fit at a given rho and returns diagnostics
+
+inspect_ols_diag <- function(rho, seed = 60603,
+n_train = 2000, n_test = 1000) {
+set.seed(seed)
+trte <- gen_train_test(
+p       = p,
+rho     = rho,
+n_train = n_train,
+n_test  = n_test,
+beta    = beta,
+SNR     = SNR
+)
+tr <- trte$train
+te <- trte$test
+
+std   <- standardize_by_train(tr$X, te$X)
+Xtr_s <- std$Xtr
+ytr   <- tr$y
+
+fit_ols <- ols_model(Xtr_s, ytr)
+
+# Coefficients + standard errors + p-values
+
+coef_tab <- as.data.frame(summary(fit_ols$model)$coefficients)
+coef_tab <- tibble::rownames_to_column(coef_tab, "term")
+
+# VIF
+
+vif_vals <- fit_ols$info$vif
+if (!all(is.na(vif_vals))) {
+vif_tab <- tibble(
+term = names(vif_vals),
+VIF  = as.numeric(vif_vals)
+)
+} else {
+vif_tab <- tibble(term = character(0), VIF = numeric(0))
+}
+
+list(
+rho        = rho,
+coef_table = coef_tab,
+vif_table  = vif_tab,
+cond_num   = fit_ols$info$condition_number
+)
+}
+
+# Run diagnostics for low and high correlation
+
+ols_low  <- inspect_ols_diag(rho = 0.0)
+ols_high <- inspect_ols_diag(rho = 0.95)
+
+vif_low  <- ols_low$vif_table  %>% mutate(rho = 0.0)
+vif_high <- ols_high$vif_table %>% mutate(rho = 0.95)
+
+vif_both <- bind_rows(vif_low, vif_high) %>%
+filter(term != "(Intercept)") %>%
+mutate(rho = factor(rho))
+
+ggplot(vif_both, aes(x = term, y = VIF, fill = rho)) +
+geom_col(position = "dodge") +
+geom_hline(yintercept = 5, linetype = "dashed") +
+labs(
+title = "OLS VIFs under low (ρ = 0) and high (ρ = 0.95) multicollinearity",
+x     = "Predictor",
+y     = "Variance Inflation Factor",
+fill  = expression(rho)
+) +
+theme_minimal(base_size = 13) +
+theme(
+axis.text.x = element_text(angle = 45, hjust = 1)
+)
+
+
+cond_tab <- tibble(
+rho      = c(ols_low$rho, ols_high$rho),
+cond_num = c(ols_low$cond_num, ols_high$cond_num)
+)
+
+kable(
+cond_tab,
+digits  = 2,
+caption = "Condition number of the OLS design matrix under low (ρ = 0) and high (ρ = 0.95) predictor correlation."
+)
+
+
+coef_low <- ols_low$coef_table %>%
+filter(term != "(Intercept)") %>%
+mutate(rho = 0.0)
+
+coef_high <- ols_high$coef_table %>%
+filter(term != "(Intercept)") %>%
+mutate(rho = 0.95)
+
+coef_both <- bind_rows(coef_low, coef_high) %>%
+select(rho, term, Estimate, `Std. Error`, `Pr(>|t|)`) %>%
+arrange(term, rho)
+
+kable(
+coef_both,
+digits  = 3,
+caption = "OLS estimates, standard errors, and p-values under low and high multicollinearity."
+)
+
+```
+
+### Discussion
+
+We investigated how increasing correlation among predictors affects OLS, Ridge, and LASSO in terms of prediction accuracy, coefficient stability, model sparsity, and classical inferential diagnostics.
+
+#### 1. Multicollinearity has little impact on predictive accuracy
+
+Predictive accuracy declines as predictor correlation increases. The best test RMSE changes in the extremes in the following way:
+
+-   At ρ = 0: OLS = 2.171, Ridge = 2.176, LASSO = 2.167
+-   At ρ = 0.99: OLS = 4.600, Ridge = 4.593, LASSO = 4.585
+
+So it reflects a harder estimation problem as information becomes redundant (Table: *Test RMSE Summary*). However, the three methods remain extremely close to each other at every correlation level: the largest gap between the best and worst model is only **0.015 RMSE units**, as shown in *Figure: Excess Test RMSE Relative to the Best Method*. In other words, while multicollinearity reduces overall predictive accuracy, it does **not** produce meaningful performance differences between OLS, Ridge, and LASSO in this setting. Given the large sample size and high signal-to-noise ratio, regularization offers benefits primarily in coefficient stability rather than prediction.
+
+------------------------------------------------------------------------
+
+#### 2. Shrinkage behavior differs, but Ridge does not meaningfully constrain model complexity
+
+In *Figure: Penalty and Effective Complexity vs ρ*:
+
+-   Ridge λ increases from \~0.20 (ρ=0) to \~0.65 (ρ=0.99), but **effective df remains 20**, meaning Ridge shrinks coefficients without reducing dimensionality.
+-   LASSO λ increases slightly and **df drops from \~11 to \~5**, indicating true sparsification under high correlation.
+
+Thus:
+
+-   **Ridge smooths estimates but keeps full model.**
+-   **LASSO both shrinks and removes variables.**
+
+------------------------------------------------------------------------
+
+#### 3. LASSO selection remains stable for true signal variables
+
+In *Figure: LASSO Selection Heatmap* and the selection table:
+
+| Variable | ρ = 0      | ρ = 0.99  |
+|----------|------------|-----------|
+| x1       | 1.00       | **0.995** |
+| x3       | 1.00       | **0.890** |
+| x5       | 1.00       | **0.735** |
+
+Signal variables remain frequently selected, although smaller signals weaken as correlation increases.
+
+Noise variables show decreasing selection rates (e.g., x10: 0.43 → 0.13), meaning **multicollinearity reduces false positives in this setting**, contrary to common expectations.
+
+------------------------------------------------------------------------
+
+#### 4. OLS inference becomes unreliable despite stable predictive performance
+
+Although predictive RMSE changes minimally, coefficients and p-values shift dramatically under high correlation, seen in *Table: OLS Estimates Under Low and High ρ*.
+
+Examples:
+
+-   True β₃ = 1.2
+    -   ρ=0 → 1.18 (p \< 0.001)\
+    -   ρ=0.95 → 0.65 (p = 0.135)
+-   Noise variable x6 (β = 0)
+    -   ρ=0 → 0.052 (p = 0.295)
+    -   ρ=0.95 → -1.019 (**p = 0.018**, false discovery)
+
+Condition number increases from **1.38 → 25.58**, confirming severe multicollinearity.
+
+**Conclusion:** Multicollinearity mainly harms interpretability and variance estimation, not prediction.
+
+------------------------------------------------------------------------
+
+### Summary of the conclusions
+
+> In this simulation, multicollinearity does **not significantly affect predictive accuracy across models**, but it substantially destabilizes coefficient estimates and hypothesis testing for OLS. Ridge mitigates magnitude inflation without reducing model dimensionality, while LASSO maintains high selection rates for true predictors but weakens when predictors carry redundant information. The primary effect of multicollinearity is on inference and interpretability—not prediction.
